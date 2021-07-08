@@ -32,7 +32,9 @@ from torchvision import models as torchvision_models
 
 import utils
 import vision_transformer as vits
-from vision_transformer import DINOHead
+from vision_transformer import DINOMatchHead
+from eval_or_predict import eval_or_predict
+from eval_or_predict_knn import eval_or_predict_knn
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -51,6 +53,9 @@ def get_args_parser():
         values leads to better performance but requires more memory. Applies only
         for ViTs (vit_tiny, vit_small and vit_base). If <16, we recommend disabling
         mixed precision training (--use_fp16 false) to avoid unstabilities.""")
+    parser.add_argument('--pretrained_weights', default=None, type=str, help="Path to pretrained weights if needed")
+    parser.add_argument("--checkpoint_key", default="teacher", type=str,
+                        help='Key to use in the checkpoint (example: "teacher")')
     parser.add_argument('--out_dim', default=65536, type=int, help="""Dimensionality of
         the DINO head output. For complex and large datasets large values (like 65k) work well.""")
     parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag,
@@ -62,6 +67,13 @@ def get_args_parser():
         We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
         help="Whether to use batch normalizations in projection head (Default: False)")
+
+    # Match parameters (SemCo like)
+    parser.add_argument('--pl_thresh', default=0.95, type=float, help="""Pseudo-labeling threshold for fixmatch-like loss. 
+    Only unlabeled instances with confidence exceeding this threshold will be included in pseudo-labeling loss""")
+    parser.add_argument('--lam_dino', default=1.0, type=float, help="""Modulation factor for dino loss""")
+    parser.add_argument('--lam_sup', default=1.0, type=float, help="""Modulation factor for supervised loss""")
+    parser.add_argument('--lam_pl', default=1.0, type=float, help="""Modulation factor for pseudo-label loss""")
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -87,7 +99,11 @@ def get_args_parser():
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
     parser.add_argument('--batch_size_per_gpu', default=64, type=int,
-        help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
+        help='Per-GPU batch-size : number of distinct unlabelled images loaded on one GPU.')
+    parser.add_argument('--mu', default=8, type=int,
+                        help='Ratio of unlabelled to labelled data per batch. '
+                             'For example, if batch_size_per_gpu is 64, '
+                             'the effective images loaded on one gpu per batch would be 64 + 64/mu ')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
@@ -101,13 +117,16 @@ def get_args_parser():
         end of optimization. We use a cosine LR schedule with linear warmup.""")
     parser.add_argument('--optimizer', default='adamw', type=str,
         choices=['adamw', 'sgd', 'lars'], help="""Type of optimizer. We recommend using adamw with ViTs.""")
+    parser.add_argument('--eval', type=utils.bool_flag, default=True, help="""If set, evaluation on 'val' directory data 
+    will be performed at the beginning of every epoch of training.""")
 
     # Multi-crop parameters
     parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""")
-    parser.add_argument('--local_crops_number', type=int, default=8, help="""Number of small
+    #todo Islam set this to 6, it was 8 originally
+    parser.add_argument('--local_crops_number', type=int, default=6, help="""Number of small
         local views to generate. Set this parameter to 0 to disable multi-crop training.
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """)
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
@@ -115,8 +134,9 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
-    parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
-        help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--data_path', default='/path/to/imagenet/', type=str,
+        help='Please specify path to the training data directory which which contains train, val and test directories.'
+             'train directory should contain labelled and unlabelled subdirectories')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -135,22 +155,44 @@ def train_dino(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    transform = DataAugmentationDINO(
+    tic = time.time()
+    transform = DataAugmentationDINOMatch(
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        sampler=sampler,
+    # create unlabeled training dataset or load it if it exists
+    dataset_name = Path(args.data_path).name
+    dataset_object_path = os.path.join(args.output_dir, f'{dataset_name}_dataset_object.pth')
+    if os.path.exists(dataset_object_path):
+        print(f'Loading dataset object directly from {dataset_object_path}')
+        dataset_unlabelled = torch.load(dataset_object_path)
+    else:
+        dataset_unlabelled = datasets.ImageFolder(Path(args.data_path)/'train', transform=transform)
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        torch.save(dataset_unlabelled, dataset_object_path)
+    sampler_unlabelled = torch.utils.data.DistributedSampler(dataset_unlabelled, shuffle=True)
+    data_loader_unlabelled = torch.utils.data.DataLoader(
+        dataset_unlabelled,
+        sampler=sampler_unlabelled,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
     )
-    print(f"Data loaded: there are {len(dataset)} images.")
+    dataset_labelled = datasets.ImageFolder(Path(args.data_path)/'train/labelled', transform=transform.global_transfo3)
+    sampler_labelled = torch.utils.data.DistributedSampler(dataset_labelled, shuffle=True)
+    data_loader_labelled = torch.utils.data.DataLoader(
+        dataset_labelled,
+        sampler=sampler_labelled,
+        batch_size=int(args.batch_size_per_gpu / args.mu),
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    num_classes = len(dataset_labelled.classes)
+    print(f"Data loaded in {int((time.time()-tic)/60)} minutes: there are {len(dataset_unlabelled)} images, "
+          f"out of which {len(dataset_labelled)} are labelled.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -171,17 +213,23 @@ def train_dino(args):
     else:
         print(f"Unknow architecture: {args.arch}")
 
+    # load pretrained weights if specified
+    if args.pretrained_weights is not None:
+        utils.load_pretrained_weights(student, args.pretrained_weights, args.checkpoint_key, args.arch,
+                                          args.patch_size)
     # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(student, DINOHead(
+    student = utils.MultiCropWrapper(student, DINOMatchHead(
         embed_dim,
         args.out_dim,
+        num_classes,
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
     ))
     teacher = utils.MultiCropWrapper(
         teacher,
-        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
+        DINOMatchHead(embed_dim, args.out_dim, num_classes, args.use_bn_in_head),
     )
+
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -204,13 +252,19 @@ def train_dino(args):
     print(f"Student and Teacher are built: they are both {args.arch} network.")
 
     # ============ preparing loss ... ============
-    dino_loss = DINOLoss(
+    dino_match_loss = DINOMatchLoss(
         args.out_dim,
-        args.local_crops_number + 2,  # total number of crops = 2 global crops + local_crops_number
+        # total number of crops = 3 global crops + local_crops_number + 1 labelled  - Islam added one more global crop compared to dino
+        args.local_crops_number + 3,
         args.warmup_teacher_temp,
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
+        pseudo_label_threshold=args.pl_thresh,
+        lambda_dino=args.lam_dino,
+        lambda_sup=args.lam_sup,
+        lambda_pl=args.lam_pl
+
     ).cuda()
 
     # ============ preparing optimizer ... ============
@@ -227,20 +281,21 @@ def train_dino(args):
         fp16_scaler = torch.cuda.amp.GradScaler()
 
     # ============ init schedulers ... ============
+    # todo: do we need to change scaling rule for learning rate considering the mu extra images
     lr_schedule = utils.cosine_scheduler(
         args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,  # linear scaling rule
         args.min_lr,
-        args.epochs, len(data_loader),
+        args.epochs, len(data_loader_unlabelled),
         warmup_epochs=args.warmup_epochs,
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
         args.weight_decay_end,
-        args.epochs, len(data_loader),
+        args.epochs, len(data_loader_unlabelled),
     )
     # momentum parameter is increased to 1. during training with a cosine schedule
     momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1,
-                                               args.epochs, len(data_loader))
+                                               args.epochs, len(data_loader_unlabelled))
     print(f"Loss, optimizer and schedulers ready.")
 
     # ============ optionally resume training ... ============
@@ -252,18 +307,24 @@ def train_dino(args):
         teacher=teacher,
         optimizer=optimizer,
         fp16_scaler=fp16_scaler,
-        dino_loss=dino_loss,
+        dino_match_loss=dino_match_loss,
     )
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
     print("Starting DINO training !")
     for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
+        eval_stats = {}
+        if args.eval:
+            # _ , eval_stats = eval_or_predict(teacher, args, eval=True)
+            top1, top5, _ = eval_or_predict_knn(args, [1,10], eval=True)
+
+        data_loader_unlabelled.sampler.set_epoch(epoch)
+        data_loader_labelled.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
-        train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
-            data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
+        train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss,
+            data_loader_unlabelled, data_loader_labelled, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
 
         # ============ writing logs ... ============
@@ -273,7 +334,7 @@ def train_dino(args):
             'optimizer': optimizer.state_dict(),
             'epoch': epoch + 1,
             'args': args,
-            'dino_loss': dino_loss.state_dict(),
+            'dino_match_loss': dino_match_loss.state_dict(),
         }
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
@@ -281,6 +342,7 @@ def train_dino(args):
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     **{f'Val_{k}': v for k, v in eval_stats.items()},
                      'epoch': epoch}
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
@@ -290,26 +352,34 @@ def train_dino(args):
     print('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
-                    optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
-                    fp16_scaler, args):
+def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data_loader_unlabelled,
+                    data_loader_labelled, optimizer, lr_schedule, wd_schedule, momentum_schedule,
+                    epoch, fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    dl_lab = iter(data_loader_labelled)
+    for it, (images, dummy) in enumerate(metric_logger.log_every(data_loader_unlabelled, 10, header)):
         # update weight decay and learning rate according to their schedule
-        it = len(data_loader) * epoch + it  # global training iteration
+        it = len(data_loader_unlabelled) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
-
-        # move images to gpu
+        # load labeled images
+        images_labelled, lbs = next(dl_lab)
+        images.append(images_labelled)
+        # obtain split map to know how to split after forward
+        # (could have been calculated via batch_size and mu but kept here for further flexibility, e.g. dynamic batch size)
+        split_map = [batch.shape[0] for batch in images]
+        # move tensors to gpu
         images = [im.cuda(non_blocking=True) for im in images]
+        lbs = lbs.cuda()
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
-            loss = dino_loss(student_output, teacher_output, epoch)
+            teacher_dino_output, _ = teacher(images[:2])  # only the 2 global views pass through the teacher
+            student_dino_output, student_cls_output = student(images)
+            loss, loss_stats = dino_match_loss(student_dino_output, teacher_dino_output, student_cls_output,
+                                   lbs, split_map, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -344,18 +414,21 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         # logging
         torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())
+        metric_logger.update(**loss_stats)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-class DINOLoss(nn.Module):
+class DINOMatchLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
                  warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
-                 center_momentum=0.9):
+                 center_momentum=0.9, pseudo_label_threshold=0.95,
+                 lambda_dino=1, lambda_sup=1, lambda_pl=1):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
@@ -368,20 +441,27 @@ class DINOLoss(nn.Module):
                         teacher_temp, warmup_teacher_temp_epochs),
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
+        self.pseudo_label_threshold = pseudo_label_threshold
+        self.lambda_dino = lambda_dino
+        self.lambda_sup = lambda_sup
+        self.lambda_pl = lambda_pl
 
-    def forward(self, student_output, teacher_output, epoch):
+    def forward(self, student_dino_output, teacher_dino_output, student_cls_output, labels, split_map, epoch):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
-        student_out = student_output / self.student_temp
-        student_out = student_out.chunk(self.ncrops)
+        student_out = student_dino_output / self.student_temp
+        student_out = torch.split(student_out, split_map)
+        student_out = student_out[:-2]
+        # student_out = student_out[:-self.lab_bs].chunk(self.ncrops)[:-1]
+
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
-        teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
+        teacher_out = F.softmax((teacher_dino_output - self.center) / temp, dim=-1)
         teacher_out = teacher_out.detach().chunk(2)
 
-        total_loss = 0
+        dino_loss = 0
         n_loss_terms = 0
         for iq, q in enumerate(teacher_out):
             for v in range(len(student_out)):
@@ -389,11 +469,32 @@ class DINOLoss(nn.Module):
                     # we skip cases where student and teacher operate on the same view
                     continue
                 loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
-                total_loss += loss.mean()
+                dino_loss += loss.mean()
                 n_loss_terms += 1
-        total_loss /= n_loss_terms
-        self.update_center(teacher_output)
-        return total_loss
+        dino_loss /= n_loss_terms
+        self.update_center(teacher_dino_output)
+
+        # supervised loss
+        # student_cls_out = [*student_cls_output[:-self.lab_bs].chunk(self.ncrops), student_cls_output[-self.lab_bs:]]
+        student_cls_out = torch.split(student_cls_output, split_map)
+        criterion = lambda inp, targ: F.cross_entropy(inp, targ, reduction='none')
+        # todo consider using all the crops (3 globals + locals) to calculate the loss here or maybe only globals?
+        loss_sup = criterion(student_cls_out[-1], labels).mean() #student_cls_out[-1]: classifier logits for labelled weakly aug
+        # pseudo-label loss
+        # guess the labels and apply confidence threshold
+        with torch.no_grad():
+            probs = torch.softmax(student_cls_out[-2], dim=1) #student_cls_out[-2]: classifier logits for unlabelled weakly aug
+            scores, lbs_u_guess = torch.max(probs, dim=1)
+            mask = scores.ge(self.pseudo_label_threshold).float()
+        # apply loss
+        loss_pl = (criterion(student_cls_out[0], lbs_u_guess) * mask).mean() #student_cls_out[0]: classifier logits for unlabelled strongly aug
+
+        # combine all losses
+        total_loss = self.lambda_dino * dino_loss + self.lambda_sup * loss_sup + self.lambda_pl * loss_pl
+        with torch.no_grad():
+            loss_stats = {'loss_dino': dino_loss.item(), 'loss_sup': loss_sup.item(), 'loss_pl': loss_pl.item(),
+                         'mask': mask.mean().item(), 'confidence': scores.mean().item()}
+        return total_loss, loss_stats
 
     @torch.no_grad()
     def update_center(self, teacher_output):
@@ -408,7 +509,7 @@ class DINOLoss(nn.Module):
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
-class DataAugmentationDINO(object):
+class DataAugmentationDINOMatch(object):
     def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
@@ -438,6 +539,12 @@ class DataAugmentationDINO(object):
             utils.Solarization(0.2),
             normalize,
         ])
+        # third global crop - with minimal transform for Match loss
+        self.global_transfo3 = transforms.Compose([
+            transforms.RandomResizedCrop(224, interpolation=Image.BICUBIC),
+            transforms.RandomHorizontalFlip(),
+            normalize,
+        ])
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = transforms.Compose([
@@ -453,6 +560,7 @@ class DataAugmentationDINO(object):
         crops.append(self.global_transfo2(image))
         for _ in range(self.local_crops_number):
             crops.append(self.local_transfo(image))
+        crops.append(self.global_transfo3(image))
         return crops
 
 

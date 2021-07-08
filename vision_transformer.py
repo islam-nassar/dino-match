@@ -254,8 +254,8 @@ def vit_base(patch_size=16, **kwargs):
     return model
 
 
-class DINOHead(nn.Module):
-    def __init__(self, in_dim, out_dim, use_bn=False, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256):
+class DINOMatchHead(nn.Module):
+    def __init__(self, in_dim, out_dim, num_classes, use_bn=False, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256):
         super().__init__()
         nlayers = max(nlayers, 1)
         if nlayers == 1:
@@ -277,6 +277,7 @@ class DINOHead(nn.Module):
         self.last_layer.weight_g.data.fill_(1)
         if norm_last_layer:
             self.last_layer.weight_g.requires_grad = False
+        self.last_layer_classifier = nn.utils.weight_norm(nn.Linear(bottleneck_dim, num_classes, bias=False))
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -287,5 +288,6 @@ class DINOHead(nn.Module):
     def forward(self, x):
         x = self.mlp(x)
         x = nn.functional.normalize(x, dim=-1, p=2)
-        x = self.last_layer(x)
-        return x
+        dino_out = self.last_layer(x)
+        class_logits = self.last_layer_classifier(x)
+        return dino_out, class_logits
