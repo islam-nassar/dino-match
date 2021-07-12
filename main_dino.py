@@ -29,6 +29,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
+from torchvision.transforms import InterpolationMode
 
 import utils
 import vision_transformer as vits
@@ -69,7 +70,7 @@ def get_args_parser():
         help="Whether to use batch normalizations in projection head (Default: False)")
 
     # Match parameters (SemCo like)
-    parser.add_argument('--pl_thresh', default=0.95, type=float, help="""Pseudo-labeling threshold for fixmatch-like loss. 
+    parser.add_argument('--pl_thresh', default=0.9, type=float, help="""Pseudo-labeling threshold for fixmatch-like loss. 
     Only unlabeled instances with confidence exceeding this threshold will be included in pseudo-labeling loss""")
     parser.add_argument('--lam_dino', default=1.0, type=float, help="""Modulation factor for dino loss""")
     parser.add_argument('--lam_sup', default=1.0, type=float, help="""Modulation factor for supervised loss""")
@@ -315,9 +316,13 @@ def train_dino(args):
     print("Starting DINO training !")
     for epoch in range(start_epoch, args.epochs):
         eval_stats = {}
-        if args.eval:
-            # _ , eval_stats = eval_or_predict(teacher, args, eval=True)
-            top1, top5, _ = eval_or_predict_knn(args, [1,10], eval=True)
+        top1_knn = [0]
+        if args.eval and utils.is_main_process():
+            print('Evaluating Linearly...')
+            _ , eval_stats = eval_or_predict(teacher, args, eval=True)
+            # print('Evaluating KNN...')
+            # top1_knn, top5_knn, _ = eval_or_predict_knn(args, [10, 20, 100, 200], eval=True)
+        dist.barrier() # so that other dist processes wait till evaluation is complete
 
         data_loader_unlabelled.sampler.set_epoch(epoch)
         data_loader_labelled.sampler.set_epoch(epoch)
@@ -342,8 +347,8 @@ def train_dino(args):
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'Val_{k}': v for k, v in eval_stats.items()},
-                     'epoch': epoch}
+                     **{f'val_{k}': v for k, v in eval_stats.items()},
+                     'epoch': epoch, 'val_KNN_top1': np.mean(top1_knn)}
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -366,7 +371,15 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
         # load labeled images
-        images_labelled, lbs = next(dl_lab)
+        try:
+            images_labelled, lbs = next(dl_lab)
+        except StopIteration:
+            if utils.is_main_process():
+                print('recreating dataloder for labelled data')
+                dl_lab = iter(data_loader_labelled)
+            else:
+                print('passing')
+                pass
         images.append(images_labelled)
         # obtain split map to know how to split after forward
         # (could have been calculated via batch_size and mu but kept here for further flexibility, e.g. dynamic batch size)
@@ -526,14 +539,14 @@ class DataAugmentationDINOMatch(object):
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
@@ -541,14 +554,14 @@ class DataAugmentationDINOMatch(object):
         ])
         # third global crop - with minimal transform for Match loss
         self.global_transfo3 = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BICUBIC),
             transforms.RandomHorizontalFlip(),
             normalize,
         ])
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = transforms.Compose([
-            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,

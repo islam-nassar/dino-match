@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import pandas as pd
+import shutil
 
 
 def lwll_to_imagenet_directory_structure(source_path, destination_path, train_labels_dict, val_labels_dict=None,
@@ -10,17 +11,21 @@ def lwll_to_imagenet_directory_structure(source_path, destination_path, train_la
 
     train
         labelled
+            <imagenet-like structure> (directories with class names containing raw image files)
         unlabelled
+            UNKNOWN_class (containing raw training unlabeled images)
      val
-        labelled
+        <imagenet-like structure> (directories with class names containing raw image files)
      test
-        unlabelled
+        UNKNOWN_class (containing raw test unlabeled images)
 
     source_path: str or Path denoting the lwll parent dir (e.g. data/cifar100 containing cifar100_full, cifar100_sample,etc.)
     destination_path: str or Path denoting the target dir under which will be created train, test, val subdirectories
     train_labels_dict: dictionary containing {img_name: label} pairs for all training labels (under train folder)
     val_labels_dict: if specified should contain {prefix/img_name: label} pairs for validation dataset. If none, validation will be empty
     sample: if set, the sample version of the dataset will be transformed (opposed to the full version)
+    nshot: integer if passed will randomly sample n-shots per class and use as labeled data and rest will be unlabelled
+    seed: random seed for nshot
     """
     source_path = Path(source_path)
     destination_path = Path(destination_path)
@@ -93,10 +98,33 @@ def lwll_to_imagenet_directory_structure(source_path, destination_path, train_la
     if val_labels_dict is not None:
         print('Validation size:', len(val_labels_dict))
 
+def create_nshot(source_path, destination_path, train_labels_dict, val_labels_dict=None,
+                                         sample=False, nshot=None, seed=123):
+    if os.path.exists(destination_path):
+        print('Deleting destination')
+        shutil.rmtree(destination_path)
+
+    assert nshot <= 10, 'n too high'
+    df = pd.DataFrame.from_dict(train_labels_dict, orient='index').reset_index()
+    df.columns = ['id', 'cls']
+    new_labels = {}
+    for cls in df.cls.unique():
+        filtered = df[df.cls == cls]
+        if filtered.shape[0] < nshot:
+            print(f'{cls} has only {filtered.shape[0]} images..')
+            new_labels.update({img: cls for img in filtered.id.values})
+        else:
+            images = filtered.sample(n=nshot, replace=False, random_state=seed)
+            new_labels.update({img:cls for img in images.id.values})
+    lwll_to_imagenet_directory_structure(source_path, destination_path, new_labels, val_labels_dict,
+                                         sample)
+
+
+
 
 if __name__ == '__main__':
-    source = Path('/home/inas0003/data/external/pool_car_detection/')
-    dest = Path('/home/inas0003/data/external/pool_car_detection_standard/')
+    source = Path('/home/inas0003/data/external/domain_net-clipart/')
+    dest = Path('/home/inas0003/data/external/domain_net-clipart_standard_10shot/')
     sfx = 'full'
     train_labels = pd.read_feather(source/f'labels_{sfx}/labels_train.feather')
     train_labels = dict(zip(train_labels.id.values, train_labels['class'].values))
@@ -104,4 +132,5 @@ if __name__ == '__main__':
     val_labels = dict(zip(val_labels.id.values, val_labels['class'].values))
     val_labels = {f'test/{k}':v for k,v in val_labels.items()}
 
-    lwll_to_imagenet_directory_structure(source, dest, train_labels, val_labels)
+    #lwll_to_imagenet_directory_structure(source, dest, train_labels, val_labels)
+    create_nshot(source, dest, train_labels, val_labels, nshot=10, seed=000)

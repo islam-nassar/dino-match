@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 from torchvision import datasets
 from torchvision import transforms as pth_transforms
+from torchvision.transforms import InterpolationMode
 
 import utils
 import vision_transformer as vits
@@ -29,7 +30,7 @@ import vision_transformer as vits
 def eval_or_predict(model, args, eval=True):
     # ============ preparing data ... ============
     val_transform = pth_transforms.Compose([
-        pth_transforms.Resize(256, interpolation=3),
+        pth_transforms.Resize(256, interpolation=InterpolationMode.BICUBIC),
         pth_transforms.CenterCrop(224),
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
@@ -38,7 +39,7 @@ def eval_or_predict(model, args, eval=True):
                                        transform=val_transform)
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
-        batch_size=args.batch_size_per_gpu,
+        batch_size=args.batch_size_per_gpu * 4,
         num_workers=args.num_workers,
         pin_memory=True,
     )
@@ -53,7 +54,7 @@ def eval_or_predict(model, args, eval=True):
     header = 'Val:'
     all_preds = []
     with torch.no_grad():
-        for inp, target in metric_logger.log_every(val_loader, 20, header) if eval else val_loader:
+        for inp, target in metric_logger.log_every(val_loader, 50, header) if eval else val_loader:
             # move to gpu
             inp = inp.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
@@ -86,35 +87,6 @@ def eval_or_predict(model, args, eval=True):
         predictions = torch.cat(all_preds)
         model.train()
         return predictions, {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('Evaluation with linear classification on ImageNet')
-    parser.add_argument('--n_last_blocks', default=4, type=int, help="""Concatenate [CLS] tokens
-        for the `n` last blocks. We use `n=4` when evaluating ViT-Small and `n=1` with ViT-Base.""")
-    parser.add_argument('--avgpool_patchtokens', default=False, type=utils.bool_flag,
-        help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
-        We typically set this to False for ViT-Small and to True with ViT-Base.""")
-    parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'vit_base'], help='Architecture (support only ViT atm).')
-    parser.add_argument('--patch_size', default=16, type=int, help='Patch resolution of the model.')
-    parser.add_argument('--pretrained_weights', default='', type=str, help="Path to pretrained weights to evaluate.")
-    parser.add_argument("--checkpoint_key", default="teacher", type=str, help='Key to use in the checkpoint (example: "teacher")')
-    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
-    parser.add_argument("--lr", default=0.001, type=float, help="""Learning rate at the beginning of
-        training (highest LR used during training). The learning rate is linearly scaled
-        with the batch size, and specified here for a reference batch size of 256.
-        We recommend tweaking the LR depending on the checkpoint evaluated.""")
-    parser.add_argument('--batch_size_per_gpu', default=128, type=int, help='Per-GPU batch-size')
-    parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
-        distributed training; see https://pytorch.org/docs/stable/distributed.html""")
-    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
-    parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
-    parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
-    parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")
-    parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
-    parser.add_argument('--num_labels', default=1000, type=int, help='Number of labels for linear classifier')
-    args = parser.parse_args()
 
 
     # TODO maybe make it a standalone
