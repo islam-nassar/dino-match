@@ -70,8 +70,10 @@ def get_args_parser():
         help="Whether to use batch normalizations in projection head (Default: False)")
 
     # Match parameters (SemCo like)
-    parser.add_argument('--pl_thresh', default=0.9, type=float, help="""Pseudo-labeling threshold for fixmatch-like loss. 
-    Only unlabeled instances with confidence exceeding this threshold will be included in pseudo-labeling loss""")
+    parser.add_argument('--start_pl_epoch', default=30, type=int, help="""epoch at which pseudo-label threshold will 
+    be calculated and pseudo-loss will start to be considered""")
+    parser.add_argument('--confidence_percentile', default=95, type=int, help="""Pseudo-labeling percentile for fixmatch-like loss. 
+    Only unlabeled instances within this confidence percentile will be included in pseudo-labeling loss""")
     parser.add_argument('--lam_dino', default=1.0, type=float, help="""Modulation factor for dino loss""")
     parser.add_argument('--lam_sup', default=1.0, type=float, help="""Modulation factor for supervised loss""")
     parser.add_argument('--lam_pl', default=1.0, type=float, help="""Modulation factor for pseudo-label loss""")
@@ -139,7 +141,7 @@ def get_args_parser():
         help='Please specify path to the training data directory which which contains train, val and test directories.'
              'train directory should contain labelled and unlabelled subdirectories')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
-    parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
+    parser.add_argument('--saveckp_freq', default=50, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
@@ -261,7 +263,6 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
-        pseudo_label_threshold=args.pl_thresh,
         lambda_dino=args.lam_dino,
         lambda_sup=args.lam_sup,
         lambda_pl=args.lam_pl
@@ -434,13 +435,18 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+    # update pseudo-label confidence - TODO what if it is restoring from a higher checkpoint
+    if epoch == args.start_pl_epoch - 1 and utils.is_main_process():
+        conf_thresh = np.percentile(metric_logger.meters['confidence'].deque, args.confidence_percentile)
+        dino_match_loss.set_confidence_threshold(conf_thresh)
+        print(f'Pseudo-labelling threshold updated to {conf_thresh}')
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 class DINOMatchLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
                  warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
-                 center_momentum=0.9, pseudo_label_threshold=0.95,
+                 center_momentum=0.9,
                  lambda_dino=1, lambda_sup=1, lambda_pl=1):
         super().__init__()
         self.student_temp = student_temp
@@ -454,10 +460,12 @@ class DINOMatchLoss(nn.Module):
                         teacher_temp, warmup_teacher_temp_epochs),
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
-        self.pseudo_label_threshold = pseudo_label_threshold
+        self.pseudo_label_threshold = 1.
+        self.confidence_scores = [] # to hold a list of max confidences per epoch
         self.lambda_dino = lambda_dino
         self.lambda_sup = lambda_sup
         self.lambda_pl = lambda_pl
+
 
     def forward(self, student_dino_output, teacher_dino_output, student_cls_output, labels, split_map, epoch):
         """
@@ -499,6 +507,7 @@ class DINOMatchLoss(nn.Module):
             probs = torch.softmax(student_cls_out[-2], dim=1) #student_cls_out[-2]: classifier logits for unlabelled weakly aug
             scores, lbs_u_guess = torch.max(probs, dim=1)
             mask = scores.ge(self.pseudo_label_threshold).float()
+
         # apply loss
         loss_pl = (criterion(student_cls_out[0], lbs_u_guess) * mask).mean() #student_cls_out[0]: classifier logits for unlabelled strongly aug
 
@@ -506,7 +515,8 @@ class DINOMatchLoss(nn.Module):
         total_loss = self.lambda_dino * dino_loss + self.lambda_sup * loss_sup + self.lambda_pl * loss_pl
         with torch.no_grad():
             loss_stats = {'loss_dino': dino_loss.item(), 'loss_sup': loss_sup.item(), 'loss_pl': loss_pl.item(),
-                         'mask': mask.mean().item(), 'confidence': scores.mean().item()}
+                         'mask': mask.mean().item(), 'confidence': scores.mean().item(),
+                          'conf_thresh': self.pseudo_label_threshold}
         return total_loss, loss_stats
 
     @torch.no_grad()
@@ -520,6 +530,13 @@ class DINOMatchLoss(nn.Module):
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+
+    @torch.no_grad()
+    def set_confidence_threshold(self, value):
+        """
+        set_confidence_threshold for pseudo-labeling
+        """
+        self.pseudo_label_threshold = value
 
 
 class DataAugmentationDINOMatch(object):
