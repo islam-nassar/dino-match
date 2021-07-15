@@ -274,7 +274,6 @@ def train_dino(args):
         args.warmup_teacher_temp_epochs,
         args.epochs,
         student_classifier_temp=args.student_cls_temp,
-        confidence_threshold=args.confidence_threshold,
         lambda_dino=args.lam_dino,
         lambda_sup=args.lam_sup,
         lambda_pl=args.lam_pl
@@ -336,13 +335,19 @@ def train_dino(args):
             # eval_linear(_get_args_eval(args, num_classes))
             _ , eval_stats = eval_or_predict(teacher, args, eval=True)
             # print('Evaluating KNN...')
-            top1_knn, top5_knn, _ = eval_or_predict_knn(args, [10, 20, 100, 200], eval=True)
+            if epoch > 0 and epoch%10 == 0:
+                top1_knn, top5_knn, _ = eval_or_predict_knn(args, [10, 20, 100, 200], eval=True)
         dist.barrier() # so that other dist processes wait till evaluation is complete
 
         data_loader_unlabelled.sampler.set_epoch(epoch)
         data_loader_labelled.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
+        if epoch < args.start_pl_epoch:
+            dino_match_loss.lambda_pl = 0.
+        else:
+            print(f'Pseudo-labeling loss is on')
+            dino_match_loss.lambda_pl = args.lam_pl
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss,
             data_loader_unlabelled, data_loader_labelled, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
@@ -367,20 +372,9 @@ def train_dino(args):
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-        # # ============ updating pseudo-labeling confidence threshold ... ============
-        # # Commented for now TODO what if it is restoring from a higher checkpoint
-        # if 'confidence' in train_stats:
-        #     confidences.append(train_stats['confidence'])
-        #     print(f'Confidences so far: {confidences}')
-        #     if epoch >= args.start_pl_epoch - 1 and len(confidences) > 2:
-        #         new_thresh = confidences[-1] * confidences[-1] / confidences[-3]
-        #         print(f'Setting confidence threshold to {new_thresh}')
-        #         dino_match_loss.set_confidence_threshold(new_thresh)
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-
-
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data_loader_unlabelled,
@@ -412,10 +406,10 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
         lbs = lbs.cuda()
         # teacher and student forward passes + compute dinomatch loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_dino_output, _ = teacher(images[:2])  # only the 2 global views pass through the teacher
+            teacher_dino_output, teacher_cls_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             student_dino_output, student_cls_output = student(images)
             loss, loss_stats = dino_match_loss(student_dino_output, teacher_dino_output, student_cls_output,
-                                   lbs, split_map, epoch)
+                                               teacher_cls_output, lbs, split_map, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -463,7 +457,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
 class DINOMatchLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
                  warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
-                 center_momentum=0.9, student_classifier_temp=0.1, confidence_threshold=0.95,
+                 center_momentum=0.9, student_classifier_temp=0.1,
                  lambda_dino=1, lambda_sup=1, lambda_pl=1):
         super().__init__()
         self.student_temp = student_temp
@@ -477,21 +471,20 @@ class DINOMatchLoss(nn.Module):
                         teacher_temp, warmup_teacher_temp_epochs),
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
-        self.pseudo_label_threshold = confidence_threshold
         self.student_classifier_temp = student_classifier_temp # to hold a list of max confidences per epoch
         self.lambda_dino = lambda_dino
         self.lambda_sup = lambda_sup
         self.lambda_pl = lambda_pl
 
 
-    def forward(self, student_dino_output, teacher_dino_output, student_cls_output, labels, split_map, epoch):
+    def forward(self, student_dino_output, teacher_dino_output, student_cls_output, teacher_cls_output,
+                labels, split_map, epoch):
         """
-        Cross-entropy between softmax outputs of the teacher and student networks.
+        dino-match losses comprising dino loss, supervised loss and pseudo-label losses.
         """
         student_out = student_dino_output / self.student_temp
         student_out = torch.split(student_out, split_map)
         student_out = student_out[:-2]
-        # student_out = student_out[:-self.lab_bs].chunk(self.ncrops)[:-1]
 
 
         # teacher centering and sharpening
@@ -515,27 +508,26 @@ class DINOMatchLoss(nn.Module):
         # supervised loss
         # student_cls_out = [*student_cls_output[:-self.lab_bs].chunk(self.ncrops), student_cls_output[-self.lab_bs:]]
         #student_cls_out = student_cls_output / self.student_classifier_temp
-        student_cls_out = torch.split(student_cls_output / self.student_classifier_temp, split_map)
+        student_cls_out = torch.split(student_cls_output, split_map)
         criterion = lambda inp, targ: F.cross_entropy(inp, targ, reduction='none')
         # todo consider using all the crops (3 globals + locals) to calculate the loss here or maybe only globals?
         loss_sup = criterion(student_cls_out[-1], labels).mean() #student_cls_out[-1]: classifier logits for labelled weakly aug
         # pseudo-label loss
-        # guess the labels and apply confidence threshold
+        # get a soft pseudo-label as the average of all augmented versions and sharpen it
         with torch.no_grad():
-            probs = torch.softmax(student_cls_out[-2], dim=1) #student_cls_out[-2]: classifier logits for unlabelled weakly aug
-            scores, lbs_u_guess = torch.max(probs, dim=1)
-            mask = scores.ge(self.pseudo_label_threshold).float()
+            teacher_cls_out = teacher_cls_output.detach().chunk(2)
+            lbs_u_guess = torch.mean(torch.stack(teacher_cls_out), dim=0) / temp
+            lbs_u_guess = F.softmax(lbs_u_guess, dim=-1)
+
 
         # apply loss
-        toss = np.random.randint(0, 2) # to choose one of the two global_crops for strong augments
-        loss_pl = (criterion(student_cls_out[toss], lbs_u_guess) * mask).mean() #student_cls_out[toss]: classifier logits for unlabelled strongly aug
+        loss_pl = torch.sum(-lbs_u_guess * F.log_softmax(student_cls_out[-2]/self.student_classifier_temp, dim=-1),
+                            dim=-1).mean()
 
         # combine all losses
         total_loss = self.lambda_dino * dino_loss + self.lambda_sup * loss_sup + self.lambda_pl * loss_pl
         with torch.no_grad():
-            loss_stats = {'loss_dino': dino_loss.item(), 'loss_sup': loss_sup.item(), 'loss_pl': loss_pl.item(),
-                         'mask': mask.mean().item(), 'confidence': scores.mean().item(),
-                          'conf_thresh': self.pseudo_label_threshold}
+            loss_stats = {'loss_dino': dino_loss.item(), 'loss_sup': loss_sup.item(), 'loss_pl': loss_pl.item()}
         return total_loss, loss_stats
 
     @torch.no_grad()
@@ -549,13 +541,6 @@ class DINOMatchLoss(nn.Module):
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
-
-    @torch.no_grad()
-    def set_confidence_threshold(self, value):
-        """
-        set_confidence_threshold for pseudo-labeling
-        """
-        self.pseudo_label_threshold = value
 
 
 class DataAugmentationDINOMatch(object):
