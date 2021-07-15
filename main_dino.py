@@ -36,6 +36,8 @@ import vision_transformer as vits
 from vision_transformer import DINOMatchHead
 from eval_or_predict import eval_or_predict
 from eval_or_predict_knn import eval_or_predict_knn
+from eval_linear import eval_linear
+from copy import deepcopy
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -70,10 +72,13 @@ def get_args_parser():
         help="Whether to use batch normalizations in projection head (Default: False)")
 
     # Match parameters (SemCo like)
-    parser.add_argument('--start_pl_epoch', default=30, type=int, help="""epoch at which pseudo-label threshold will 
+    parser.add_argument('--start_pl_epoch', default=20, type=int, help="""epoch at which pseudo-label threshold will 
     be calculated and pseudo-loss will start to be considered""")
     parser.add_argument('--confidence_percentile', default=95, type=int, help="""Pseudo-labeling percentile for fixmatch-like loss. 
     Only unlabeled instances within this confidence percentile will be included in pseudo-labeling loss""")
+    parser.add_argument('--confidence_threshold', default=0.95, type=float, help="""confidence threshold for pseudo-labeling""")
+    parser.add_argument('--student_cls_temp', default=0.1, type=float, help="""student classifier head temperature, i.e.,  
+    for supervised and pseudo-labelling loss""")
     parser.add_argument('--lam_dino', default=1.0, type=float, help="""Modulation factor for dino loss""")
     parser.add_argument('--lam_sup', default=1.0, type=float, help="""Modulation factor for supervised loss""")
     parser.add_argument('--lam_pl', default=1.0, type=float, help="""Modulation factor for pseudo-label loss""")
@@ -146,6 +151,8 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
+    parser.add_argument("--dist_master_port", default="29500", type=str, help="""MASTER_PORT used for torch distributed.
+    Change that if you want to run two scripts simultaneously on the same local machine""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
@@ -154,7 +161,10 @@ def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
-    print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+    conf_print = "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
+    print(conf_print)
+    if utils.is_main_process():
+        (Path(args.output_dir)/'config.txt').open('w').write(conf_print)
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
@@ -191,7 +201,7 @@ def train_dino(args):
         batch_size=int(args.batch_size_per_gpu / args.mu),
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=False,
     )
     num_classes = len(dataset_labelled.classes)
     print(f"Data loaded in {int((time.time()-tic)/60)} minutes: there are {len(dataset_unlabelled)} images, "
@@ -263,6 +273,8 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
+        student_classifier_temp=args.student_cls_temp,
+        confidence_threshold=args.confidence_threshold,
         lambda_dino=args.lam_dino,
         lambda_sup=args.lam_sup,
         lambda_pl=args.lam_pl
@@ -315,14 +327,16 @@ def train_dino(args):
 
     start_time = time.time()
     print("Starting DINO training !")
+    # confidences = []
     for epoch in range(start_epoch, args.epochs):
         eval_stats = {}
         top1_knn = [0]
         if args.eval and utils.is_main_process():
             print('Evaluating Linearly...')
+            # eval_linear(_get_args_eval(args, num_classes))
             _ , eval_stats = eval_or_predict(teacher, args, eval=True)
             # print('Evaluating KNN...')
-            # top1_knn, top5_knn, _ = eval_or_predict_knn(args, [10, 20, 100, 200], eval=True)
+            top1_knn, top5_knn, _ = eval_or_predict_knn(args, [10, 20, 100, 200], eval=True)
         dist.barrier() # so that other dist processes wait till evaluation is complete
 
         data_loader_unlabelled.sampler.set_epoch(epoch)
@@ -353,9 +367,20 @@ def train_dino(args):
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+        # # ============ updating pseudo-labeling confidence threshold ... ============
+        # # Commented for now TODO what if it is restoring from a higher checkpoint
+        # if 'confidence' in train_stats:
+        #     confidences.append(train_stats['confidence'])
+        #     print(f'Confidences so far: {confidences}')
+        #     if epoch >= args.start_pl_epoch - 1 and len(confidences) > 2:
+        #         new_thresh = confidences[-1] * confidences[-1] / confidences[-3]
+        #         print(f'Setting confidence threshold to {new_thresh}')
+        #         dino_match_loss.set_confidence_threshold(new_thresh)
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+
+
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data_loader_unlabelled,
@@ -375,12 +400,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
         try:
             images_labelled, lbs = next(dl_lab)
         except StopIteration:
-            if utils.is_main_process():
-                print('recreating dataloder for labelled data')
-                dl_lab = iter(data_loader_labelled)
-            else:
-                print('passing')
-                pass
+            print('Recreating dataloder for labelled data')
+            dl_lab = iter(data_loader_labelled)
+            images_labelled, lbs = next(dl_lab)
         images.append(images_labelled)
         # obtain split map to know how to split after forward
         # (could have been calculated via batch_size and mu but kept here for further flexibility, e.g. dynamic batch size)
@@ -388,7 +410,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
         # move tensors to gpu
         images = [im.cuda(non_blocking=True) for im in images]
         lbs = lbs.cuda()
-        # teacher and student forward passes + compute dino loss
+        # teacher and student forward passes + compute dinomatch loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_dino_output, _ = teacher(images[:2])  # only the 2 global views pass through the teacher
             student_dino_output, student_cls_output = student(images)
@@ -435,18 +457,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    # update pseudo-label confidence - TODO what if it is restoring from a higher checkpoint
-    if epoch == args.start_pl_epoch - 1 and utils.is_main_process():
-        conf_thresh = np.percentile(metric_logger.meters['confidence'].deque, args.confidence_percentile)
-        dino_match_loss.set_confidence_threshold(conf_thresh)
-        print(f'Pseudo-labelling threshold updated to {conf_thresh}')
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 class DINOMatchLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
                  warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
-                 center_momentum=0.9,
+                 center_momentum=0.9, student_classifier_temp=0.1, confidence_threshold=0.95,
                  lambda_dino=1, lambda_sup=1, lambda_pl=1):
         super().__init__()
         self.student_temp = student_temp
@@ -460,8 +477,8 @@ class DINOMatchLoss(nn.Module):
                         teacher_temp, warmup_teacher_temp_epochs),
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
-        self.pseudo_label_threshold = 1.
-        self.confidence_scores = [] # to hold a list of max confidences per epoch
+        self.pseudo_label_threshold = confidence_threshold
+        self.student_classifier_temp = student_classifier_temp # to hold a list of max confidences per epoch
         self.lambda_dino = lambda_dino
         self.lambda_sup = lambda_sup
         self.lambda_pl = lambda_pl
@@ -497,7 +514,8 @@ class DINOMatchLoss(nn.Module):
 
         # supervised loss
         # student_cls_out = [*student_cls_output[:-self.lab_bs].chunk(self.ncrops), student_cls_output[-self.lab_bs:]]
-        student_cls_out = torch.split(student_cls_output, split_map)
+        #student_cls_out = student_cls_output / self.student_classifier_temp
+        student_cls_out = torch.split(student_cls_output / self.student_classifier_temp, split_map)
         criterion = lambda inp, targ: F.cross_entropy(inp, targ, reduction='none')
         # todo consider using all the crops (3 globals + locals) to calculate the loss here or maybe only globals?
         loss_sup = criterion(student_cls_out[-1], labels).mean() #student_cls_out[-1]: classifier logits for labelled weakly aug
@@ -509,7 +527,8 @@ class DINOMatchLoss(nn.Module):
             mask = scores.ge(self.pseudo_label_threshold).float()
 
         # apply loss
-        loss_pl = (criterion(student_cls_out[0], lbs_u_guess) * mask).mean() #student_cls_out[0]: classifier logits for unlabelled strongly aug
+        toss = np.random.randint(0, 2) # to choose one of the two global_crops for strong augments
+        loss_pl = (criterion(student_cls_out[toss], lbs_u_guess) * mask).mean() #student_cls_out[toss]: classifier logits for unlabelled strongly aug
 
         # combine all losses
         total_loss = self.lambda_dino * dino_loss + self.lambda_sup * loss_sup + self.lambda_pl * loss_pl
@@ -593,6 +612,16 @@ class DataAugmentationDINOMatch(object):
         crops.append(self.global_transfo3(image))
         return crops
 
+def _get_args_eval(args, num_classes):
+    args_eval = deepcopy(args)
+    args_eval.dist_master_port = '29502'
+    args_eval.n_last_blocks = 4
+    args_eval.avgpool_patchtokens = False
+    args_eval.num_labels = num_classes
+    args_eval.val_freq = 1
+    args_eval.epochs = 100
+    args_eval.lr = 0.001
+    return args_eval
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])

@@ -25,10 +25,17 @@ from torchvision import transforms as pth_transforms
 
 import utils
 import vision_transformer as vits
+import torch.distributed as dist
 
 
-def eval_linear(args):
-    utils.init_distributed_mode(args)
+def eval_linear(args, eval=True):
+    try:
+        utils.init_distributed_mode(args)
+    except:
+        dist.new_group(backend='nccl',
+                       ranks=list(range(utils.get_world_size()))
+                       )
+
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
@@ -46,8 +53,8 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
+    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train/labelled"), transform=train_transform)
+    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val" if eval else "test"), transform=val_transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -113,7 +120,7 @@ def eval_linear(args):
             log_stats = {**{k: v for k, v in log_stats.items()},
                          **{f'test_{k}': v for k, v in test_stats.items()}}
         if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
+            with (Path(args.output_dir) / "log_test.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
             save_dict = {
                 "epoch": epoch + 1,
