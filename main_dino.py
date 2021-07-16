@@ -72,7 +72,7 @@ def get_args_parser():
         help="Whether to use batch normalizations in projection head (Default: False)")
 
     # Match parameters (SemCo like)
-    parser.add_argument('--start_pl_epoch', default=20, type=int, help="""epoch at which pseudo-label threshold will 
+    parser.add_argument('--start_pl_epoch', default=4, type=int, help="""epoch at which pseudo-label threshold will 
     be calculated and pseudo-loss will start to be considered""")
     parser.add_argument('--confidence_percentile', default=95, type=int, help="""Pseudo-labeling percentile for fixmatch-like loss. 
     Only unlabeled instances within this confidence percentile will be included in pseudo-labeling loss""")
@@ -108,7 +108,7 @@ def get_args_parser():
         help optimization for larger ViT architectures. 0 for disabling.""")
     parser.add_argument('--batch_size_per_gpu', default=64, type=int,
         help='Per-GPU batch-size : number of distinct unlabelled images loaded on one GPU.')
-    parser.add_argument('--mu', default=8, type=int,
+    parser.add_argument('--mu', default=1, type=int,
                         help='Ratio of unlabelled to labelled data per batch. '
                              'For example, if batch_size_per_gpu is 64, '
                              'the effective images loaded on one gpu per batch would be 64 + 64/mu ')
@@ -224,7 +224,7 @@ def train_dino(args):
         teacher = torchvision_models.__dict__[args.arch]()
         embed_dim = student.fc.weight.shape[1]
     else:
-        print(f"Unknow architecture: {args.arch}")
+        print(f"Unknown architecture: {args.arch}")
 
     # load pretrained weights if specified
     if args.pretrained_weights is not None:
@@ -273,6 +273,7 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
+        num_classes=num_classes,
         student_classifier_temp=args.student_cls_temp,
         lambda_dino=args.lam_dino,
         lambda_sup=args.lam_sup,
@@ -335,19 +336,19 @@ def train_dino(args):
             # eval_linear(_get_args_eval(args, num_classes))
             _ , eval_stats = eval_or_predict(teacher, args, eval=True)
             # print('Evaluating KNN...')
-            if epoch > 0 and epoch%10 == 0:
-                top1_knn, top5_knn, _ = eval_or_predict_knn(args, [10, 20, 100, 200], eval=True)
+            top1_knn, top5_knn, _ = eval_or_predict_knn(args, [10, 20, 100, 200], eval=True)
         dist.barrier() # so that other dist processes wait till evaluation is complete
 
         data_loader_unlabelled.sampler.set_epoch(epoch)
         data_loader_labelled.sampler.set_epoch(epoch)
-
-        # ============ training one epoch of DINO ... ============
+        # ============ Adjusting loss from clustering space to class space... ============
         if epoch < args.start_pl_epoch:
-            dino_match_loss.lambda_pl = 0.
-        else:
-            print(f'Pseudo-labeling loss is on')
-            dino_match_loss.lambda_pl = args.lam_pl
+            dino_match_loss.lambda_pl = torch.tensor(0).cuda()
+        elif epoch == args.start_pl_epoch:
+            print(f'Changing dino loss from generic prediction space to class prediction space')
+            dino_match_loss.lambda_pl = torch.tensor(args.lam_pl).cuda()
+            dino_match_loss.lambda_dino = torch.tensor(0).cuda()
+        # ============ training one epoch of DINO Match... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss,
             data_loader_unlabelled, data_loader_labelled, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
@@ -456,14 +457,18 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
 
 class DINOMatchLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
-                 warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
-                 center_momentum=0.9, student_classifier_temp=0.1,
-                 lambda_dino=1, lambda_sup=1, lambda_pl=1):
+                 warmup_teacher_temp_epochs, nepochs, num_classes,
+                 student_temp=0.1, center_momentum=0.9, student_classifier_temp=0.1,
+                 lambda_dino=1., lambda_sup=1., lambda_pl=1. ):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.ncrops = ncrops
         self.register_buffer("center", torch.zeros(1, out_dim))
+        self.register_buffer("center_class", torch.zeros(1, num_classes))
+        self.register_buffer("lambda_dino", torch.tensor(lambda_dino))
+        self.register_buffer("lambda_sup", torch.tensor(lambda_sup))
+        self.register_buffer("lambda_pl", torch.tensor(lambda_pl))
         # we apply a warm up for the teacher temperature because
         # a too high temperature makes the training instable at the beginning
         self.teacher_temp_schedule = np.concatenate((
@@ -471,67 +476,55 @@ class DINOMatchLoss(nn.Module):
                         teacher_temp, warmup_teacher_temp_epochs),
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
-        self.student_classifier_temp = student_classifier_temp # to hold a list of max confidences per epoch
-        self.lambda_dino = lambda_dino
-        self.lambda_sup = lambda_sup
-        self.lambda_pl = lambda_pl
-
+        self.student_classifier_temp = student_classifier_temp
 
     def forward(self, student_dino_output, teacher_dino_output, student_cls_output, teacher_cls_output,
                 labels, split_map, epoch):
         """
         dino-match losses comprising dino loss, supervised loss and pseudo-label losses.
         """
-        student_out = student_dino_output / self.student_temp
-        student_out = torch.split(student_out, split_map)
-        student_out = student_out[:-2]
+        def _calculate_loss(student_output, teacher_output, generic):
+            student_out = student_output / self.student_temp
+            student_out = torch.split(student_out, split_map)
+            student_out = student_out[:-2]
 
 
-        # teacher centering and sharpening
-        temp = self.teacher_temp_schedule[epoch]
-        teacher_out = F.softmax((teacher_dino_output - self.center) / temp, dim=-1)
-        teacher_out = teacher_out.detach().chunk(2)
+            # teacher centering and sharpening
+            temp = self.teacher_temp_schedule[epoch]
+            center = self.center if generic else self.center_class
+            teacher_out = F.softmax((teacher_output - center) / temp, dim=-1)
+            teacher_out = teacher_out.detach().chunk(2)
 
-        dino_loss = 0
-        n_loss_terms = 0
-        for iq, q in enumerate(teacher_out):
-            for v in range(len(student_out)):
-                if v == iq:
-                    # we skip cases where student and teacher operate on the same view
-                    continue
-                loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
-                dino_loss += loss.mean()
-                n_loss_terms += 1
-        dino_loss /= n_loss_terms
-        self.update_center(teacher_dino_output)
+            loss = 0
+            n_loss_terms = 0
+            for iq, q in enumerate(teacher_out):
+                for v in range(len(student_out)):
+                    if v == iq:
+                        # we skip cases where student and teacher operate on the same view
+                        continue
+                    loss_batch = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
+                    loss += loss_batch.mean()
+                    n_loss_terms += 1
+            loss /= n_loss_terms
+            self.update_center(teacher_output, generic)
+            return loss
+
+        dino_loss = _calculate_loss(student_dino_output, teacher_dino_output, generic=True)
+        pl_loss = _calculate_loss(student_cls_output, teacher_cls_output, generic=False)
 
         # supervised loss
-        # student_cls_out = [*student_cls_output[:-self.lab_bs].chunk(self.ncrops), student_cls_output[-self.lab_bs:]]
-        #student_cls_out = student_cls_output / self.student_classifier_temp
         student_cls_out = torch.split(student_cls_output, split_map)
         criterion = lambda inp, targ: F.cross_entropy(inp, targ, reduction='none')
         # todo consider using all the crops (3 globals + locals) to calculate the loss here or maybe only globals?
-        loss_sup = criterion(student_cls_out[-1], labels).mean() #student_cls_out[-1]: classifier logits for labelled weakly aug
-        # pseudo-label loss
-        # get a soft pseudo-label as the average of all augmented versions and sharpen it
-        with torch.no_grad():
-            teacher_cls_out = teacher_cls_output.detach().chunk(2)
-            lbs_u_guess = torch.mean(torch.stack(teacher_cls_out), dim=0) / temp
-            lbs_u_guess = F.softmax(lbs_u_guess, dim=-1)
-
-
-        # apply loss
-        loss_pl = torch.sum(-lbs_u_guess * F.log_softmax(student_cls_out[-2]/self.student_classifier_temp, dim=-1),
-                            dim=-1).mean()
-
+        sup_loss = criterion(student_cls_out[-1], labels).mean() #student_cls_out[-1]: classifier logits for labelled weakly aug
         # combine all losses
-        total_loss = self.lambda_dino * dino_loss + self.lambda_sup * loss_sup + self.lambda_pl * loss_pl
+        total_loss = self.lambda_dino * dino_loss + self.lambda_sup * sup_loss + self.lambda_pl * pl_loss
         with torch.no_grad():
-            loss_stats = {'loss_dino': dino_loss.item(), 'loss_sup': loss_sup.item(), 'loss_pl': loss_pl.item()}
+            loss_stats = {'loss_dino': dino_loss.item(), 'loss_sup': sup_loss.item(), 'loss_pl': pl_loss.item()}
         return total_loss, loss_stats
 
     @torch.no_grad()
-    def update_center(self, teacher_output):
+    def update_center(self, teacher_output, generic):
         """
         Update center used for teacher output.
         """
@@ -540,7 +533,10 @@ class DINOMatchLoss(nn.Module):
         batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
 
         # ema update
-        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+        if generic:
+            self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+        else:
+            self.center_class = self.center_class * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
 class DataAugmentationDINOMatch(object):
