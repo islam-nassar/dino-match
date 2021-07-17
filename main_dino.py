@@ -82,6 +82,8 @@ def get_args_parser():
     parser.add_argument('--lam_dino', default=1.0, type=float, help="""Modulation factor for dino loss""")
     parser.add_argument('--lam_sup', default=1.0, type=float, help="""Modulation factor for supervised loss""")
     parser.add_argument('--lam_pl', default=1.0, type=float, help="""Modulation factor for pseudo-label loss""")
+    parser.add_argument('--lr_scaler', default=1.0, type=float, help="""Learning rate will be reduced by this factor
+    once pseudo-label loss starts""")
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -387,8 +389,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
     for it, (images, dummy) in enumerate(metric_logger.log_every(data_loader_unlabelled, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader_unlabelled) * epoch + it  # global training iteration
+        lr_scaler = 1. if epoch < args.start_pl_epoch else args.lr_scaler
         for i, param_group in enumerate(optimizer.param_groups):
-            param_group["lr"] = lr_schedule[it]
+            param_group["lr"] = lr_schedule[it] / lr_scaler
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
         # load labeled images
