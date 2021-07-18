@@ -108,7 +108,7 @@ def get_args_parser():
         help optimization for larger ViT architectures. 0 for disabling.""")
     parser.add_argument('--batch_size_per_gpu', default=64, type=int,
         help='Per-GPU batch-size : number of distinct unlabelled images loaded on one GPU.')
-    parser.add_argument('--mu', default=8, type=int,
+    parser.add_argument('--mu', default=1, type=int,
                         help='Ratio of unlabelled to labelled data per batch. '
                              'For example, if batch_size_per_gpu is 64, '
                              'the effective images loaded on one gpu per batch would be 64 + 64/mu ')
@@ -590,7 +590,7 @@ class DataAugmentationDINOMatch(object):
         ])
         # third global crop - with minimal transform for Match loss
         self.global_transfo3 = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BICUBIC),
+            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
             transforms.RandomHorizontalFlip(),
             normalize,
         ])
