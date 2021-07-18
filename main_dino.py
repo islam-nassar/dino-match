@@ -574,7 +574,7 @@ class DataAugmentationDINOMatch(object):
         ])
         # third global crop - with minimal transform for Match loss
         self.global_transfo3 = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BICUBIC),
+            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
             transforms.RandomHorizontalFlip(),
             normalize,
         ])
