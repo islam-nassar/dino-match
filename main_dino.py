@@ -338,7 +338,7 @@ def train_dino(args):
             # eval_linear(_get_args_eval(args, num_classes))
             _ , eval_stats = eval_or_predict(teacher, args, eval=True)
             # print('Evaluating KNN...')
-            top1_knn, top5_knn, _ = eval_or_predict_knn(args, [10, 20, 100, 200], eval=True)
+            top1_knn, top5_knn, _ = eval_or_predict_knn(args, [1, 10, 20, 100, 200], eval=True)
         dist.barrier() # so that other dist processes wait till evaluation is complete
 
         data_loader_unlabelled.sampler.set_epoch(epoch)
@@ -398,7 +398,6 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_match_loss, data
         try:
             images_labelled, lbs = next(dl_lab)
         except StopIteration:
-            print('Recreating dataloder for labelled data')
             dl_lab = iter(data_loader_labelled)
             images_labelled, lbs = next(dl_lab)
         images.append(images_labelled)
