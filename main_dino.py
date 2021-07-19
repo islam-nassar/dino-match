@@ -519,7 +519,7 @@ class DINOMatchLoss(nn.Module):
         student_cls_out = torch.split(student_cls_output, split_map)
         criterion = lambda inp, targ: F.cross_entropy(inp, targ, reduction='none')
         # todo consider using all the crops (3 globals + locals) to calculate the loss here or maybe only globals?
-        sup_loss = criterion(student_cls_out[-1], labels).mean() #student_cls_out[-1]: classifier logits for labelled weakly aug
+        sup_loss = criterion(student_cls_out[-1] / self.student_temp, labels).mean() #student_cls_out[-1]: classifier logits for labelled weakly aug
         # combine all losses
         total_loss = self.lambda_dino * dino_loss + self.lambda_sup * sup_loss + self.lambda_pl * pl_loss
         with torch.no_grad():
@@ -574,7 +574,7 @@ class DataAugmentationDINOMatch(object):
         ])
         # third global crop - with minimal transform for Match loss
         self.global_transfo3 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
+            transforms.RandomResizedCrop(224, scale=(0.9, 1.), interpolation=InterpolationMode.BICUBIC),
             transforms.RandomHorizontalFlip(),
             normalize,
         ])
